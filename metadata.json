@@ -1,0 +1,6 @@
+{
+  "name": "Image Steganography",
+  "description": "Hide and extract encrypted secrets inside PNG, JPEG, and BMP files with absolute pixel-fidelity.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
