@@ -7,9 +7,6 @@ import com.example.stego.StegoCrypto
 import com.example.stego.SteganographyEngine
 import com.example.stego.db.StegoHistory
 import com.example.stego.db.StegoRepository
-import com.sun.net.httpserver.HttpExchange
-import com.sun.net.httpserver.HttpHandler
-import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -17,19 +14,23 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
-import java.io.InputStreamReader
+import java.io.InputStream
 import java.io.OutputStream
-import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Socket
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 class StegoWebServer(
     private val context: android.content.Context,
     private val repository: StegoRepository,
     private val scope: CoroutineScope
 ) {
-    private var server: HttpServer? = null
+    private var serverSocket: ServerSocket? = null
+    private var isRunning = false
+    private val executor: ExecutorService = Executors.newFixedThreadPool(4)
     var boundPort: Int = 8080
         private set
 
@@ -39,20 +40,25 @@ class StegoWebServer(
         var startedSuccessfully = false
         while (port < 8090 && !startedSuccessfully) {
             try {
-                val currentServer = HttpServer.create(InetSocketAddress(port), 0)
-                currentServer.createContext("/", RootHandler())
-                currentServer.createContext("/api/encode", EncodeHandler())
-                currentServer.createContext("/api/decode", DecodeHandler())
-                currentServer.createContext("/api/history", HistoryHandler())
-                currentServer.createContext("/api/history/clear", HistoryClearHandler())
-                
-                // Set fixed executor for handling concurrent requests
-                currentServer.executor = java.util.concurrent.Executors.newFixedThreadPool(4)
-                currentServer.start()
-                
-                server = currentServer
+                serverSocket = ServerSocket(port)
                 boundPort = port
+                isRunning = true
                 startedSuccessfully = true
+                
+                // Start background thread for listening loop
+                Thread {
+                    while (isRunning) {
+                        try {
+                            val socket = serverSocket?.accept() ?: break
+                            executor.submit {
+                                handleClient(socket)
+                            }
+                        } catch (e: Exception) {
+                            if (!isRunning) break
+                        }
+                    }
+                }.start()
+                
             } catch (e: Exception) {
                 e.printStackTrace()
                 port++
@@ -61,58 +67,142 @@ class StegoWebServer(
     }
 
     fun stop() {
+        isRunning = false
         try {
-            server?.stop(0)
+            serverSocket?.close()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        try {
+            executor.shutdownNow()
         } catch (e: Exception) {
             e.printStackTrace()
         }
     }
 
-    private fun addCorsAndDefaultHeaders(exchange: HttpExchange, contentType: String) {
-        exchange.responseHeaders.add("Access-Control-Allow-Origin", "*")
-        exchange.responseHeaders.add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        exchange.responseHeaders.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
-        exchange.responseHeaders.add("Content-Type", contentType)
-    }
-
-    private fun handleOptions(exchange: HttpExchange): Boolean {
-        if (exchange.requestMethod.equals("OPTIONS", ignoreCase = true)) {
-            addCorsAndDefaultHeaders(exchange, "text/plain")
-            exchange.sendResponseHeaders(204, -1)
-            exchange.close()
-            return true
-        }
-        return false
-    }
-
-    private fun sendResponse(exchange: HttpExchange, statusCode: Int, body: String) {
-        val bytes = body.toByteArray(StandardCharsets.UTF_8)
-        exchange.sendResponseHeaders(statusCode, bytes.size.toLong())
-        val os: OutputStream = exchange.responseBody
-        os.write(bytes)
-        os.flush()
-        os.close()
-    }
-
-    private fun sendError(exchange: HttpExchange, errorMessage: String, statusCode: Int = 400) {
+    private fun handleClient(socket: Socket) {
+        var inputStream: InputStream? = null
+        var outputStream: OutputStream? = null
         try {
-            val responseObj = JSONObject()
-            responseObj.put("success", false)
-            responseObj.put("error", errorMessage)
-            sendResponse(exchange, statusCode, responseObj.toString())
+            inputStream = socket.getInputStream()
+            outputStream = socket.getOutputStream()
+
+            // Function to read raw bytes until a line delimiter \n
+            fun readLineBytes(ins: InputStream): ByteArray {
+                val baos = ByteArrayOutputStream()
+                while (true) {
+                    val b = ins.read()
+                    if (b == -1) break
+                    if (b == '\n'.code) {
+                        baos.write(b)
+                        break
+                    }
+                    baos.write(b)
+                }
+                return baos.toByteArray()
+            }
+
+            // Read the request/status line
+            val firstLineBytes = readLineBytes(inputStream)
+            if (firstLineBytes.isEmpty()) return
+            val firstLine = String(firstLineBytes, StandardCharsets.UTF_8).trim()
+            val parts = firstLine.split(" ")
+            if (parts.size < 2) return
+            val method = parts[0].uppercase()
+            val path = parts[1]
+
+            // Read headers
+            var contentLength = 0
+            while (true) {
+                val lineBytes = readLineBytes(inputStream)
+                val line = String(lineBytes, StandardCharsets.UTF_8).trim()
+                if (line.isEmpty()) break // End of headers
+                
+                val headerParts = line.split(":", limit = 2)
+                if (headerParts.size == 2) {
+                    val name = headerParts[0].trim().lowercase()
+                    if (name == "content-length") {
+                        contentLength = headerParts[1].trim().toIntOrNull() ?: 0
+                    }
+                }
+            }
+
+            // Read body bytes if Content-Length specified
+            val body = if (contentLength > 0) {
+                val bodyBytes = ByteArray(contentLength)
+                var totalRead = 0
+                while (totalRead < contentLength) {
+                    val read = inputStream.read(bodyBytes, totalRead, contentLength - totalRead)
+                    if (read == -1) break
+                    totalRead += read
+                }
+                String(bodyBytes, StandardCharsets.UTF_8)
+            } else {
+                ""
+            }
+
+            // Handle OPTIONS / preflight request
+            if (method == "OPTIONS") {
+                sendResponse(outputStream, 204, "text/plain", "")
+                return
+            }
+
+            when {
+                path == "/" && method == "GET" -> {
+                    sendResponse(outputStream, 200, "text/html; charset=utf-8", StegoWebAssets.INDEX_HTML)
+                }
+                path == "/api/encode" && method == "POST" -> {
+                    handleEncode(body, outputStream)
+                }
+                path == "/api/decode" && method == "POST" -> {
+                    handleDecode(body, outputStream)
+                }
+                path == "/api/history" && method == "GET" -> {
+                    handleHistory(outputStream)
+                }
+                path == "/api/history/clear" && method == "POST" -> {
+                    handleHistoryClear(outputStream)
+                }
+                else -> {
+                    sendError(outputStream, "Endpoint not found: $path", 404)
+                }
+            }
         } catch (e: Exception) {
             e.printStackTrace()
+            try {
+                if (outputStream != null) {
+                    sendError(outputStream, "Internal Handler Failure: ${e.message}", 500)
+                }
+            } catch (ex: Exception) {}
+        } finally {
+            try {
+                socket.close()
+            } catch (e: Exception) {}
         }
     }
 
-    private fun readRequestBody(exchange: HttpExchange): String {
-        val reader = BufferedReader(InputStreamReader(exchange.requestBody, StandardCharsets.UTF_8))
-        val sb = StringBuilder()
-        var line: String?
-        while (reader.readLine().also { line = it } != null) {
-            sb.append(line)
+    private fun sendResponse(output: OutputStream, statusCode: Int, contentType: String, body: String) {
+        val bodyBytes = body.toByteArray(StandardCharsets.UTF_8)
+        val responseHeaders = buildString {
+            append("HTTP/1.1 $statusCode OK\r\n")
+            append("Access-Control-Allow-Origin: *\r\n")
+            append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n")
+            append("Access-Control-Allow-Headers: Content-Type, Authorization\r\n")
+            append("Content-Type: $contentType\r\n")
+            append("Content-Length: ${bodyBytes.size}\r\n")
+            append("Connection: close\r\n")
+            append("\r\n")
         }
-        return sb.toString()
+        output.write(responseHeaders.toByteArray(StandardCharsets.UTF_8))
+        output.write(bodyBytes)
+        output.flush()
+    }
+
+    private fun sendError(output: OutputStream, errorMessage: String, statusCode: Int = 400) {
+        val json = JSONObject()
+        json.put("success", false)
+        json.put("error", errorMessage)
+        sendResponse(output, statusCode, "application/json", json.toString())
     }
 
     private fun base64ToBitmap(b64String: String): Bitmap {
@@ -133,268 +223,192 @@ class StegoWebServer(
         return "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
     }
 
-    // -----------------------------------------------------------------
-    // HANDLERS
-    // -----------------------------------------------------------------
-
-    private inner class RootHandler : HttpHandler {
-        override fun handle(exchange: HttpExchange) {
-            try {
-                if (handleOptions(exchange)) return
-                
-                addCorsAndDefaultHeaders(exchange, "text/html; charset=utf-8")
-                sendResponse(exchange, 200, StegoWebAssets.INDEX_HTML)
-            } catch (e: Exception) {
-                e.printStackTrace()
-                sendError(exchange, "Internal Server Error: ${e.message}", 500)
-            } finally {
-                exchange.close()
-            }
+    private fun handleEncode(body: String, output: OutputStream) {
+        if (body.isEmpty()) {
+            sendError(output, "Request body empty.")
+            return
         }
-    }
 
-    private inner class EncodeHandler : HttpHandler {
-        override fun handle(exchange: HttpExchange) {
-            try {
-                if (handleOptions(exchange)) return
-                
-                addCorsAndDefaultHeaders(exchange, "application/json")
-                
-                if (!exchange.requestMethod.equals("POST", ignoreCase = true)) {
-                    sendError(exchange, "Method not allowed. Use POST.")
-                    return
-                }
+        try {
+            val json = JSONObject(body)
+            val imageB64 = json.getString("imageB64")
+            val fileName = json.optString("fileName", "undefined_web_canvas.png")
+            val message = json.getString("message")
+            val password = json.optString("password", "")
+            val useEncryption = json.optBoolean("useEncryption", false)
+            val format = json.optString("format", "PNG")
 
-                val requestText = readRequestBody(exchange)
-                if (requestText.isEmpty()) {
-                    sendError(exchange, "Request body empty.")
-                    return
-                }
+            if (message.isEmpty()) {
+                sendError(output, "Message payload cannot be empty.")
+                return
+            }
 
-                val json = JSONObject(requestText)
-                val imageB64 = json.getString("imageB64")
-                val fileName = json.optString("fileName", "undefined_web_canvas.png")
-                val message = json.getString("message")
-                val password = json.optString("password", "")
-                val useEncryption = json.optBoolean("useEncryption", false)
-                val format = json.optString("format", "PNG")
+            if (useEncryption && password.isEmpty()) {
+                sendError(output, "Passphrase is required when encryption toggle is set.")
+                return
+            }
 
-                if (message.isEmpty()) {
-                    sendError(exchange, "Message payload cannot be empty.")
-                    return
-                }
+            val sourceBitmap = base64ToBitmap(imageB64)
+            val rawPayloadBytes = message.toByteArray(StandardCharsets.UTF_8)
+            
+            val payloadBytes = if (useEncryption) {
+                StegoCrypto.encrypt(rawPayloadBytes, password.toCharArray())
+            } else {
+                rawPayloadBytes
+            }
 
-                if (useEncryption && password.isEmpty()) {
-                    sendError(exchange, "Passphrase is required when encryption toggle is set.")
-                    return
-                }
+            val encodedBitmap = SteganographyEngine.hideData(sourceBitmap, payloadBytes, useEncryption)
+            val encodedB64 = bitmapToBase64(encodedBitmap, format)
 
-                // Run stego calculation
-                val sourceBitmap = base64ToBitmap(imageB64)
-                val rawPayloadBytes = message.toByteArray(StandardCharsets.UTF_8)
-                
-                val payloadBytes = if (useEncryption) {
-                    StegoCrypto.encrypt(rawPayloadBytes, password.toCharArray())
-                } else {
-                    rawPayloadBytes
-                }
+            val width = sourceBitmap.width
+            val height = sourceBitmap.height
+            val maxCapacityBytes = ((width * height * 3) / 8)
+            val requiredBytes = payloadBytes.size + 8
 
-                // Try to hide the data
-                val encodedBitmap = SteganographyEngine.hideData(sourceBitmap, payloadBytes, useEncryption)
-                val encodedB64 = bitmapToBase64(encodedBitmap, format)
+            val savedDownloadPath = com.example.stego.StegoImageHelper.downloadImageToPublicDownloads(context, encodedBitmap, format)
 
-                val width = sourceBitmap.width
-                val height = sourceBitmap.height
-                val maxCapacityBytes = ((width * height * 3) / 8)
-                val requiredBytes = payloadBytes.size + 8
-
-                // Automatically write to persistent public Downloads folder for user convenience
-                val savedDownloadPath = com.example.stego.StegoImageHelper.downloadImageToPublicDownloads(context, encodedBitmap, format)
-
-                // Store history logs to our Room database
-                scope.launch {
-                    repository.insert(
-                        StegoHistory(
-                            actionType = "HIDE",
-                            imageName = fileName,
-                            payloadSize = message.length,
-                            isEncrypted = useEncryption,
-                            wasSuccessful = true,
-                            details = "Embedded via PixelSecured Web Server Console. Formatted loss-free."
-                        )
+            scope.launch {
+                repository.insert(
+                    StegoHistory(
+                        actionType = "HIDE",
+                        imageName = fileName,
+                        payloadSize = message.length,
+                        isEncrypted = useEncryption,
+                        wasSuccessful = true,
+                        details = "Embedded via PixelSecured Web Server Console. Formatted loss-free."
                     )
-                }
-
-                val outJson = JSONObject()
-                outJson.put("success", true)
-                outJson.put("encodedImageB64", encodedB64)
-                outJson.put("capacity", maxCapacityBytes)
-                outJson.put("requiredSize", requiredBytes)
-                outJson.put("savedPath", savedDownloadPath ?: "Sandbox Memory Pipeline")
-                
-                sendResponse(exchange, 200, outJson.toString())
-            } catch (e: Exception) {
-                e.printStackTrace()
-                sendError(exchange, "Steganographic embedding error: " + e.localizedMessage)
-            } finally {
-                exchange.close()
+                )
             }
+
+            val outJson = JSONObject()
+            outJson.put("success", true)
+            outJson.put("encodedImageB64", encodedB64)
+            outJson.put("capacity", maxCapacityBytes)
+            outJson.put("requiredSize", requiredBytes)
+            outJson.put("savedPath", savedDownloadPath ?: "Sandbox Memory Pipeline")
+
+            sendResponse(output, 200, "application/json", outJson.toString())
+        } catch (e: Exception) {
+            e.printStackTrace()
+            sendError(output, "Steganographic embedding error: " + e.localizedMessage)
         }
     }
 
-    private inner class DecodeHandler : HttpHandler {
-        override fun handle(exchange: HttpExchange) {
-            try {
-                if (handleOptions(exchange)) return
-                
-                addCorsAndDefaultHeaders(exchange, "application/json")
+    private fun handleDecode(body: String, output: OutputStream) {
+        if (body.isEmpty()) {
+            sendError(output, "Request body empty.")
+            return
+        }
 
-                if (!exchange.requestMethod.equals("POST", ignoreCase = true)) {
-                    sendError(exchange, "Method not allowed. Use POST.")
-                    return
-                }
+        try {
+            val json = JSONObject(body)
+            val imageB64 = json.getString("imageB64")
+            val fileName = json.optString("fileName", "parse_stego_web_canvas.png")
+            val password = json.optString("password", "")
 
-                val requestText = readRequestBody(exchange)
-                val json = JSONObject(requestText)
-                val imageB64 = json.getString("imageB64")
-                val fileName = json.optString("fileName", "parse_stego_web_canvas.png")
-                val password = json.optString("password", "")
+            val bitmap = base64ToBitmap(imageB64)
+            val extractedResult = SteganographyEngine.extractData(bitmap)
 
-                val bitmap = base64ToBitmap(imageB64)
-                
-                val extractedResult = SteganographyEngine.extractData(bitmap)
-                if (extractedResult == null) {
-                    scope.launch {
-                        repository.insert(
-                            StegoHistory(
-                                actionType = "EXTRACT",
-                                imageName = fileName,
-                                payloadSize = 0,
-                                isEncrypted = false,
-                                wasSuccessful = false,
-                                details = "Rejected: Magic signature mismatch."
-                            )
-                        )
-                    }
-                    sendError(exchange, "No valid PixelSecured signature found in this image canvas.")
-                    return
-                }
-
-                val originalMessage: String
-                val isEncrypted = extractedResult.isEncrypted
-                
-                if (isEncrypted) {
-                    if (password.isEmpty()) {
-                        sendError(exchange, "Decrypting requires authentication. Secure passphrase is missing.")
-                        return
-                    }
-                    val decryptedBytes = StegoCrypto.decrypt(extractedResult.payload, password.toCharArray())
-                    originalMessage = String(decryptedBytes, StandardCharsets.UTF_8)
-                } else {
-                    originalMessage = String(extractedResult.payload, StandardCharsets.UTF_8)
-                }
-
-                // Log a successful extraction
+            if (extractedResult == null) {
                 scope.launch {
                     repository.insert(
                         StegoHistory(
                             actionType = "EXTRACT",
                             imageName = fileName,
-                            payloadSize = originalMessage.length,
-                            isEncrypted = isEncrypted,
-                            wasSuccessful = true,
-                            details = "Verified & reconstructed successful via Web Console."
+                            payloadSize = 0,
+                            isEncrypted = false,
+                            wasSuccessful = false,
+                            details = "Rejected: Magic signature mismatch."
                         )
                     )
                 }
+                sendError(output, "No valid PixelSecured signature found in this image canvas.")
+                return
+            }
 
+            val originalMessage: String
+            val isEncrypted = extractedResult.isEncrypted
+            
+            if (isEncrypted) {
+                if (password.isEmpty()) {
+                    sendError(output, "Decrypting requires authentication. Secure passphrase is missing.")
+                    return
+                }
+                val decryptedBytes = StegoCrypto.decrypt(extractedResult.payload, password.toCharArray())
+                originalMessage = String(decryptedBytes, StandardCharsets.UTF_8)
+            } else {
+                originalMessage = String(extractedResult.payload, StandardCharsets.UTF_8)
+            }
+
+            scope.launch {
+                repository.insert(
+                    StegoHistory(
+                        actionType = "EXTRACT",
+                        imageName = fileName,
+                        payloadSize = originalMessage.length,
+                        isEncrypted = isEncrypted,
+                        wasSuccessful = true,
+                        details = "Verified & reconstructed successful via Web Console."
+                    )
+                )
+            }
+
+            val outJson = JSONObject()
+            outJson.put("success", true)
+            outJson.put("message", originalMessage)
+            outJson.put("isEncrypted", isEncrypted)
+            sendResponse(output, 200, "application/json", outJson.toString())
+        } catch (e: Exception) {
+            e.printStackTrace()
+            sendError(output, "Failed to reconstruct secret: incorrect password key or format decay.")
+        }
+    }
+
+    private fun handleHistory(output: OutputStream) {
+        scope.launch {
+            try {
+                val flowList = repository.allHistory.first()
+                val array = JSONArray()
+                for (item in flowList) {
+                    val innerObj = JSONObject()
+                    innerObj.put("id", item.id)
+                    innerObj.put("actionType", item.actionType)
+                    innerObj.put("timestamp", item.timestamp)
+                    innerObj.put("imageName", item.imageName)
+                    innerObj.put("payloadSize", item.payloadSize)
+                    innerObj.put("isEncrypted", item.isEncrypted)
+                    innerObj.put("wasSuccessful", item.wasSuccessful)
+                    innerObj.put("details", item.details)
+                    array.put(innerObj)
+                }
+                
+                withContext(Dispatchers.IO) {
+                    sendResponse(output, 200, "application/json", array.toString())
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                withContext(Dispatchers.IO) {
+                    sendError(output, "Audit query exception: ${e.message}")
+                }
+            }
+        }
+    }
+
+    private fun handleHistoryClear(output: OutputStream) {
+        scope.launch {
+            try {
+                repository.clearAll()
                 val outJson = JSONObject()
                 outJson.put("success", true)
-                outJson.put("message", originalMessage)
-                outJson.put("isEncrypted", isEncrypted)
-                sendResponse(exchange, 200, outJson.toString())
-            } catch (e: Exception) {
-                e.printStackTrace()
-                sendError(exchange, "Failed to reconstruct secret: incorrect password key or format decay.")
-            } finally {
-                exchange.close()
-            }
-        }
-    }
-
-    private inner class HistoryHandler : HttpHandler {
-        override fun handle(exchange: HttpExchange) {
-            try {
-                if (handleOptions(exchange)) return
                 
-                addCorsAndDefaultHeaders(exchange, "application/json")
-
-                scope.launch {
-                    try {
-                        val flowList = repository.allHistory.first()
-                        val array = JSONArray()
-                        for (item in flowList) {
-                            val innerObj = JSONObject()
-                            innerObj.put("id", item.id)
-                            innerObj.put("actionType", item.actionType)
-                            innerObj.put("timestamp", item.timestamp)
-                            innerObj.put("imageName", item.imageName)
-                            innerObj.put("payloadSize", item.payloadSize)
-                            innerObj.put("isEncrypted", item.isEncrypted)
-                            innerObj.put("wasSuccessful", item.wasSuccessful)
-                            innerObj.put("details", item.details)
-                            array.put(innerObj)
-                        }
-                        
-                        withContext(Dispatchers.IO) {
-                            sendResponse(exchange, 200, array.toString())
-                        }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                        withContext(Dispatchers.IO) {
-                            sendError(exchange, "Audit query exception: ${e.message}")
-                        }
-                    } finally {
-                        exchange.close()
-                    }
+                withContext(Dispatchers.IO) {
+                    sendResponse(output, 200, "application/json", outJson.toString())
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
-                sendError(exchange, "Internal Handler Failure", 500)
-                exchange.close()
-            }
-        }
-    }
-
-    private inner class HistoryClearHandler : HttpHandler {
-        override fun handle(exchange: HttpExchange) {
-            try {
-                if (handleOptions(exchange)) return
-                
-                addCorsAndDefaultHeaders(exchange, "application/json")
-
-                scope.launch {
-                    try {
-                        repository.clearAll()
-                        val outJson = JSONObject()
-                        outJson.put("success", true)
-                        
-                        withContext(Dispatchers.IO) {
-                            sendResponse(exchange, 200, outJson.toString())
-                        }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                        withContext(Dispatchers.IO) {
-                            sendError(exchange, "Wiping database exception: ${e.message}")
-                        }
-                    } finally {
-                        exchange.close()
-                    }
+                withContext(Dispatchers.IO) {
+                    sendError(output, "Wiping database exception: ${e.message}")
                 }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                sendError(exchange, "Internal Handler Failure", 500)
-                exchange.close()
             }
         }
     }
